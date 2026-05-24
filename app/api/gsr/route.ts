@@ -1,43 +1,18 @@
 import { NextResponse } from "next/server";
 import { ensureDb, sql } from "@/lib/db";
-import { fetchHistory, fetchLatestSpot, isoDate, ymd } from "@/lib/stooq";
+import { fetchLatestSpot, isoDate } from "@/lib/stooq";
 import { classify, computeBands, interpretation } from "@/lib/stats";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
-const FRESH_MS = 30 * 60 * 1000; // 30 minutes
+const FRESH_MS = 30 * 60 * 1000;
 const HISTORY_DAYS = 365;
-
-async function backfillIfEmpty() {
-  const rows = (await sql`SELECT COUNT(*)::int AS n FROM gsr_snapshots`) as Array<{ n: number }>;
-  if (rows[0]?.n && rows[0].n >= 60) return;
-
-  const end = new Date();
-  const start = new Date(end.getTime() - (HISTORY_DAYS + 5) * 86400 * 1000);
-  const [gold, silver] = await Promise.all([
-    fetchHistory("xauusd", ymd(start), ymd(end)),
-    fetchHistory("xagusd", ymd(start), ymd(end)),
-  ]);
-  if (!gold.length || !silver.length) return;
-
-  const silverByDate = new Map(silver.map((r) => [r.date, r.close]));
-  for (const g of gold) {
-    const s = silverByDate.get(g.date);
-    if (!s || s <= 0) continue;
-    const ratio = g.close / s;
-    await sql`
-      INSERT INTO gsr_snapshots (snapshot_date, gold_usd, silver_usd, ratio, source)
-      VALUES (${g.date}, ${g.close}, ${s}, ${ratio}, 'stooq-backfill')
-      ON CONFLICT (snapshot_date) DO NOTHING
-    `;
-  }
-}
 
 async function refreshLatest(force = false) {
   const latest = (await sql`
-    SELECT snapshot_date, gold_usd, silver_usd, ratio, created_at
+    SELECT snapshot_date, created_at
     FROM gsr_snapshots ORDER BY snapshot_date DESC LIMIT 1
   `) as Array<{ snapshot_date: string; created_at: string }>;
 
@@ -68,7 +43,6 @@ async function refreshLatest(force = false) {
 export async function GET(req: Request) {
   try {
     await ensureDb();
-    await backfillIfEmpty();
     const url = new URL(req.url);
     const force = url.searchParams.get("force") === "1";
     await refreshLatest(force);
@@ -95,7 +69,7 @@ export async function GET(req: Request) {
 
     if (!rows.length) {
       return NextResponse.json(
-        { error: "no_data", message: "No spot data yet. Try /api/gsr?force=1." },
+        { error: "no_data", message: "Spot feed warming up. Retry /api/gsr?force=1 in a few seconds." },
         { status: 503 },
       );
     }
@@ -103,8 +77,8 @@ export async function GET(req: Request) {
     const ratios = rows.map((r) => r.ratio);
     const bands = computeBands(ratios);
     const current = rows[rows.length - 1];
-    const zone = classify(current.ratio, bands);
-    const reading = interpretation(zone, current.ratio, bands);
+    const zone = classify(current.ratio, bands, rows.length);
+    const reading = interpretation(zone, current.ratio, bands, rows.length);
 
     return NextResponse.json({
       asOf: current.snapshot_date,
