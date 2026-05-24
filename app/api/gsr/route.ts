@@ -120,4 +120,6 @@ export async function GET(req: Request) {
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : "unknown_error";
     console.error("/api/gsr failed", e);
-    
+    return NextResponse.json({ error: "internal", message }, { status: 500 });
+  }
+}
