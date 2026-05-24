@@ -1,7 +1,6 @@
-// Stooq spot feed for gold (xauusd) and silver (xagusd), USD per oz.
-// Proven path from SpotPremium task-118 - Yahoo blocks Vercel egress IPs.
+// Spot feed. Stooq returns CSV; gold-api is JSON fallback for live.
 
-const STOOQ_HEADERS = {
+const HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36",
   Accept: "text/csv,text/plain,*/*",
@@ -9,7 +8,7 @@ const STOOQ_HEADERS = {
 
 export type SpotRow = { date: string; close: number };
 
-function parseCsv(csv: string): SpotRow[] {
+function parseCsvWithHeader(csv: string): SpotRow[] {
   const lines = csv.trim().split(/\r?\n/);
   if (lines.length < 2) return [];
   const header = lines[0].split(",").map((s) => s.trim().toLowerCase());
@@ -28,25 +27,49 @@ function parseCsv(csv: string): SpotRow[] {
   return rows;
 }
 
-export async function fetchLatestSpot(
-  symbol: "xauusd" | "xagusd",
-): Promise<SpotRow | null> {
-  // Daily endpoint returns the most recent close as last row.
-  const url = `https://stooq.com/q/l/?s=${symbol}&i=d`;
+async function fetchGoldApi(metal: "XAU" | "XAG"): Promise<SpotRow | null> {
   try {
-    const res = await fetch(url, {
-      headers: STOOQ_HEADERS,
+    const r = await fetch(`https://api.gold-api.com/price/${metal}`, {
+      headers: { Accept: "application/json" },
       cache: "no-store",
       signal: AbortSignal.timeout(8000),
     });
-    if (!res.ok) return null;
-    const csv = await res.text();
-    const rows = parseCsv(csv);
-    return rows.length ? rows[rows.length - 1] : null;
-  } catch (e) {
-    console.error(`stooq latest fetch failed for ${symbol}`, e);
+    if (!r.ok) return null;
+    const j = (await r.json()) as { price?: number; updatedAt?: string };
+    if (!j.price || j.price <= 0) return null;
+    const d = j.updatedAt ? new Date(j.updatedAt) : new Date();
+    return { date: d.toISOString().slice(0, 10), close: j.price };
+  } catch {
     return null;
   }
+}
+
+export async function fetchLatestSpot(
+  symbol: "xauusd" | "xagusd",
+): Promise<SpotRow | null> {
+  // Stooq CSV with header
+  const url = `https://stooq.com/q/l/?s=${symbol}&f=sd2t2ohlcv&h&e=csv`;
+  try {
+    const res = await fetch(url, {
+      headers: HEADERS,
+      cache: "no-store",
+      signal: AbortSignal.timeout(8000),
+    });
+    if (res.ok) {
+      const csv = await res.text();
+      const rows = parseCsvWithHeader(csv);
+      if (rows.length) {
+        const r = rows[rows.length - 1];
+        // Normalise date YYYY-MM-DD; Stooq gives "2026-05-25"
+        return { date: r.date, close: r.close };
+      }
+    }
+  } catch {
+    // fall through
+  }
+  // Fallback: gold-api.com (JSON, no auth)
+  const metal = symbol === "xauusd" ? "XAU" : "XAG";
+  return fetchGoldApi(metal);
 }
 
 export async function fetchHistory(
@@ -54,19 +77,17 @@ export async function fetchHistory(
   d1: string,
   d2: string,
 ): Promise<SpotRow[]> {
-  // d1, d2 in YYYYMMDD form
   const url = `https://stooq.com/q/d/l/?s=${symbol}&d1=${d1}&d2=${d2}&i=d`;
   try {
     const res = await fetch(url, {
-      headers: STOOQ_HEADERS,
+      headers: HEADERS,
       cache: "no-store",
       signal: AbortSignal.timeout(15000),
     });
     if (!res.ok) return [];
     const csv = await res.text();
-    return parseCsv(csv);
-  } catch (e) {
-    console.error(`stooq history fetch failed for ${symbol}`, e);
+    return parseCsvWithHeader(csv);
+  } catch {
     return [];
   }
 }
